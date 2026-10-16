@@ -1,0 +1,29 @@
+#Users
+- crud for users
+- routes for users
+- models for users
+- payment processing for users
+
+#Clients
+- crud for clients
+- routes for clients
+- models for clients
+- payment processing for clients
+
+#Services
+- crud for services
+- routes for services
+- models for services
+- payment processing for services
+
+#Transactions
+- crud for transactions
+- routes for transactions
+- models for transactions
+- payment processing for transactions
+
+#Payments *Stripe/Paypal
+- crud for payments
+- routes for payments
+- models for payments
+- payment processing for payments
