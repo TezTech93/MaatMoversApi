@@ -38,6 +38,8 @@ class Booking(Base):
     updated_at = Column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
 
     service = relationship("Service")
+    client = relationship("Client")
+    mover = relationship("Mover")
 
     __table_args__ = (
         CheckConstraint(
