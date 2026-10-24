@@ -1,13 +1,17 @@
 """Booking routes."""
-from datetime import datetime, timezone
-
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import get_current_user, require_client, require_mover
 from app.core.serializers import serialize_booking
-from app.managers import booking_manager, mover_manager, notification_manager, service_manager
+from app.managers import (
+    booking_manager,
+    mover_manager,
+    notification_manager,
+    service_manager,
+    strike_manager,
+)
 from app.models.user import User
 from app.schemas.booking import CancelBookingRequest, CreateBookingRequest
 
@@ -22,6 +26,8 @@ def create_booking(
     db: Session = Depends(get_db),
 ) -> dict:
     """Create a draft booking. Price is computed from the service and pickup→dropoff distance."""
+    if current_user.is_blocked:
+        raise HTTPException(status_code=403, detail="Account is blocked")
     service = service_manager.get_by_id(db, payload.service_id)
     if service is None or not service.is_active:
         raise HTTPException(status_code=404, detail="Service not available")
@@ -57,15 +63,16 @@ def confirm_booking(
     db: Session = Depends(get_db),
 ) -> dict:
     """Move draft → pending. Stripe Checkout will be created here in Phase 5."""
+    if current_user.is_blocked:
+        raise HTTPException(status_code=403, detail="Account is blocked")
     booking = booking_manager.get_by_id(db, booking_id)
     if booking is None or booking.client_id != current_user.client.id:
         raise HTTPException(status_code=404, detail="Booking not found")
     if booking.status != "draft":
         raise HTTPException(status_code=409, detail=f"Cannot confirm booking in status '{booking.status}'")
-    # NOTE Phase 5: create Stripe Checkout Session here and return checkout_url.
+
     booking = booking_manager.set_status(db, booking, "pending")
 
-    # Notify matching movers (in-app only in Phase 2; email/push in Phase 4)
     matches = mover_manager.find_available(
         db, lat=booking.pickup_lat, lng=booking.pickup_lng, radius_miles=25
     )
@@ -87,7 +94,7 @@ def list_bookings(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
-    """Role-aware listing: clients see their bookings, movers see theirs, admins see none via this route."""
+    """Role-aware listing: clients see their bookings, movers see theirs."""
     if current_user.client is not None:
         return {"bookings": [serialize_booking(b) for b in booking_manager.list_for_client(db, current_user.client.id)]}
     if current_user.mover is not None:
@@ -101,7 +108,7 @@ def get_booking(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
-    """Fetch a booking. Only visible to the owning client, assigned mover, or pending movers."""
+    """Fetch a booking. Visible to owning client, assigned mover, pending movers, or admin."""
     booking = booking_manager.get_by_id(db, booking_id)
     if booking is None:
         raise HTTPException(status_code=404, detail="Booking not found")
@@ -113,6 +120,26 @@ def get_booking(
     return {"booking": serialize_booking(booking)}
 
 
+@router.get("/{booking_id}/cancel-preview")
+def cancel_preview(
+    booking_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Preview the strike impact of cancelling this booking. Read-only."""
+    booking = booking_manager.get_by_id(db, booking_id)
+    if booking is None:
+        raise HTTPException(status_code=404, detail="Booking not found")
+    is_client_owner = current_user.client and booking.client_id == current_user.client.id
+    is_assigned_mover = current_user.mover and booking.mover_id == current_user.mover.id
+    if not (is_client_owner or is_assigned_mover or current_user.role == "admin"):
+        raise HTTPException(status_code=403, detail="Not authorized")
+    preview = strike_manager.evaluate_cancellation(
+        db, booking=booking, canceller=current_user
+    )
+    return {"preview": preview}
+
+
 @router.post("/{booking_id}/cancel")
 def cancel_booking(
     booking_id: int,
@@ -120,19 +147,49 @@ def cancel_booking(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
-    """Cancel a booking. Strike logic is a Phase 4 feature; Phase 2 just transitions state."""
+    """Cancel a booking. Applies strike policy and notifies the other party."""
     booking = booking_manager.get_by_id(db, booking_id)
     if booking is None:
         raise HTTPException(status_code=404, detail="Booking not found")
     is_client_owner = current_user.client and booking.client_id == current_user.client.id
     is_assigned_mover = current_user.mover and booking.mover_id == current_user.mover.id
-    if not (is_client_owner or is_assigned_mover or current_user.role == "admin"):
+    is_admin = current_user.role == "admin"
+    if not (is_client_owner or is_assigned_mover or is_admin):
         raise HTTPException(status_code=403, detail="Not authorized to cancel this booking")
     if booking.status in ("completed", "cancelled", "refunded"):
-        raise HTTPException(status_code=409, detail=f"Cannot cancel booking in status '{booking.status}'")
-    reason = payload.reason if payload else None
-    booking = booking_manager.cancel(db, booking, reason or "No reason provided")
-    return {"booking": serialize_booking(booking)}
+        raise HTTPException(
+            status_code=409, detail=f"Cannot cancel booking in status '{booking.status}'"
+        )
+
+    reason = (payload.reason if payload else None) or "No reason provided"
+    strike_result = strike_manager.apply_cancellation_strike(
+        db, booking=booking, canceller=current_user, reason=reason
+    )
+    booking = booking_manager.cancel(db, booking, reason)
+
+    try:
+        if is_client_owner and booking.mover_id and booking.mover:
+            notification_manager.create(
+                db,
+                user_id=booking.mover.user_id,
+                kind="booking_cancelled",
+                title="Booking cancelled by client",
+                body=f"Booking #{booking.id} was cancelled by the client.",
+                data={"booking_id": booking.id},
+            )
+        elif is_assigned_mover and booking.client:
+            notification_manager.create(
+                db,
+                user_id=booking.client.user_id,
+                kind="booking_cancelled",
+                title="Booking cancelled by mover",
+                body=f"Booking #{booking.id} was cancelled by the mover.",
+                data={"booking_id": booking.id},
+            )
+    except Exception as e:  # pragma: no cover
+        print(f"[bookings] notify-on-cancel failed: {e}")
+
+    return {"booking": serialize_booking(booking), "strike": strike_result}
 
 
 @router.post("/{booking_id}/complete")
@@ -141,7 +198,7 @@ def complete_booking(
     current_user: User = Depends(require_mover),
     db: Session = Depends(get_db),
 ) -> dict:
-    """Mover marks the booking complete. Phase 5 will trigger final payment/refund via webhook."""
+    """Mover marks the booking complete. Phase 5 will trigger final payment."""
     booking = booking_manager.get_by_id(db, booking_id)
     if booking is None or booking.mover_id != current_user.mover.id:
         raise HTTPException(status_code=404, detail="Booking not found")

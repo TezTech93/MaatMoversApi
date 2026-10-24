@@ -1,4 +1,5 @@
 """Response serializers. Routers return plain dicts; these functions produce them."""
+import json
 from app.models.user import User
 from app.models.mover import Mover
 from app.models.client import Client
@@ -94,12 +95,18 @@ def serialize_booking(b: Booking) -> dict:
 
 
 def serialize_notification(n: Notification) -> dict:
+    data = None
+    if n.data_json:
+        try:
+            data = json.loads(n.data_json)
+        except (ValueError, TypeError):
+            data = None
     return {
         "id": n.id,
         "kind": n.kind,
         "title": n.title,
         "body": n.body,
-        "data": n.data_json,
+        "data": data,
         "read": n.is_read,
         "created_at": _iso(n.created_at),
     }

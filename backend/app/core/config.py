@@ -14,9 +14,19 @@ class Settings(BaseSettings):
 
     JWT_SECRET_KEY: str
     JWT_ALGORITHM: str = "HS256"
-    JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # 7 days
+    JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7
 
     CORS_ORIGINS: str = "http://localhost:8081,http://localhost:19006"
+
+    # Email — SendGrid (primary), SMTP (fallback), or console (default).
+    SENDGRID_API_KEY: str = ""
+    SENDGRID_FROM_EMAIL: str = ""
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 587
+    SMTP_USER: str = ""
+    SMTP_PASS: str = ""
+    SMTP_FROM: str = ""
+    SMTP_TLS: bool = True
 
 
 settings = Settings()
