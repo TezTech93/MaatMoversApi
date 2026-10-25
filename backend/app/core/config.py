@@ -18,7 +18,7 @@ class Settings(BaseSettings):
 
     CORS_ORIGINS: str = "http://localhost:8081,http://localhost:19006"
 
-    # Email — SendGrid (primary), SMTP (fallback), or console (default).
+    # Email
     SENDGRID_API_KEY: str = ""
     SENDGRID_FROM_EMAIL: str = ""
     SMTP_HOST: str = ""
@@ -27,6 +27,12 @@ class Settings(BaseSettings):
     SMTP_PASS: str = ""
     SMTP_FROM: str = ""
     SMTP_TLS: bool = True
+
+    # Stripe
+    STRIPE_SECRET_KEY: str = ""
+    STRIPE_WEBHOOK_SECRET: str = ""
+    CHECKOUT_SUCCESS_URL: str = "http://localhost:8081/?checkout=success"
+    CHECKOUT_CANCEL_URL: str = "http://localhost:8081/?checkout=cancel"
 
 
 settings = Settings()

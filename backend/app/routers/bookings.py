@@ -11,6 +11,7 @@ from app.managers import (
     notification_manager,
     service_manager,
     strike_manager,
+    payment_manager
 )
 from app.models.user import User
 from app.schemas.booking import CancelBookingRequest, CreateBookingRequest
@@ -62,31 +63,22 @@ def confirm_booking(
     current_user: User = Depends(require_client),
     db: Session = Depends(get_db),
 ) -> dict:
-    """Move draft → pending. Stripe Checkout will be created here in Phase 5."""
+    """Create a Stripe Checkout Session for the deposit. Booking stays draft until paid."""
+    from app.routers.payments import _create_deposit_checkout
+
     if current_user.is_blocked:
         raise HTTPException(status_code=403, detail="Account is blocked")
     booking = booking_manager.get_by_id(db, booking_id)
     if booking is None or booking.client_id != current_user.client.id:
         raise HTTPException(status_code=404, detail="Booking not found")
-    if booking.status != "draft":
-        raise HTTPException(status_code=409, detail=f"Cannot confirm booking in status '{booking.status}'")
-
-    booking = booking_manager.set_status(db, booking, "pending")
-
-    matches = mover_manager.find_available(
-        db, lat=booking.pickup_lat, lng=booking.pickup_lng, radius_miles=25
+    result = _create_deposit_checkout(
+        booking=booking, current_user=current_user, db=db
     )
-    for mover, _ in matches:
-        notification_manager.create(
-            db,
-            user_id=mover.user_id,
-            kind="booking_pending",
-            title="New move near you",
-            body=f"A new move is available near {booking.pickup_address}.",
-            data={"booking_id": booking.id},
-        )
-
-    return {"booking": serialize_booking(booking), "matching_movers": len(matches)}
+    return {
+        "booking": serialize_booking(result["booking"]),
+        "checkout_url": result["checkout_url"],
+        "reused": result["reused"],
+    }
 
 
 @router.get("")
@@ -147,7 +139,7 @@ def cancel_booking(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
-    """Cancel a booking. Applies strike policy and notifies the other party."""
+    """Cancel a booking. Applies strike policy, refunds deposits when warranted, notifies the counterparty."""
     booking = booking_manager.get_by_id(db, booking_id)
     if booking is None:
         raise HTTPException(status_code=404, detail="Booking not found")
@@ -166,6 +158,23 @@ def cancel_booking(
         db, booking=booking, canceller=current_user, reason=reason
     )
     booking = booking_manager.cancel(db, booking, reason)
+
+    # Refund policy: refund deposit when the client is not at fault.
+    refund_result = None
+    deposit_paid = payment_manager.deposit_succeeded_for_booking(db, booking.id) is not None
+    if deposit_paid:
+        should_refund = False
+        if is_admin:
+            should_refund = True
+        elif is_assigned_mover:
+            should_refund = True
+        elif is_client_owner:
+            should_refund = not strike_result["strike_issued"]
+        if should_refund:
+            from app.routers.payments import refund_deposit_for_booking
+
+            refund_result = refund_deposit_for_booking(db, booking, initiated_by="auto")
+            print(f"[bookings] auto-refund for booking {booking.id}: {refund_result}")
 
     try:
         if is_client_owner and booking.mover_id and booking.mover:
@@ -186,10 +195,14 @@ def cancel_booking(
                 body=f"Booking #{booking.id} was cancelled by the mover.",
                 data={"booking_id": booking.id},
             )
-    except Exception as e:  # pragma: no cover
+    except Exception as e:
         print(f"[bookings] notify-on-cancel failed: {e}")
 
-    return {"booking": serialize_booking(booking), "strike": strike_result}
+    return {
+        "booking": serialize_booking(booking),
+        "strike": strike_result,
+        "refund": refund_result,
+    }
 
 
 @router.post("/{booking_id}/complete")
