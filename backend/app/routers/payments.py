@@ -3,20 +3,24 @@
 Phase 5.1: deposit checkout + webhook.
 Phase 5.2: final payment checkout + webhook branching.
 Phase 5.3: refunds (auto-on-cancel + admin manual) + charge.refunded webhook.
-Phase 5.4: Connect onboarding.
+Phase 5.4: Connect Express onboarding, transfers/payouts, account.updated.
 """
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.database import get_db
-from app.core.deps import require_admin, require_client
-from app.core.serializers import serialize_booking
+from app.core.deps import require_admin, require_client, require_mover
+from app.core.serializers import serialize_booking, serialize_mover
 from app.managers import (
     booking_manager,
     mover_manager,
     notification_manager,
     payment_manager,
 )
+from app.models.transaction import Transaction
 from app.models.user import User
 from app.services import stripe_service
 
@@ -25,8 +29,17 @@ router = APIRouter(prefix="/payments", tags=["payments"])
 
 
 # ═══════════════════════════════════════════════════════════
-# Internal helpers shared by routes and the cancel flow
+# Helpers
 # ═══════════════════════════════════════════════════════════
+
+def _platform_fee_cents(total_cents: int) -> int:
+    return int(round(total_cents * settings.PLATFORM_FEE_BPS / 10000))
+
+
+def _mover_payout_cents(booking) -> int:
+    fee = _platform_fee_cents(booking.total_cents)
+    return max(0, booking.total_cents - fee)
+
 
 def _create_deposit_checkout(*, booking, current_user: User, db: Session) -> dict:
     """Shared by /bookings/{id}/confirm and /payments/deposit/{id}."""
@@ -84,29 +97,30 @@ def _create_deposit_checkout(*, booking, current_user: User, db: Session) -> dic
 def refund_deposit_for_booking(
     db: Session, booking, initiated_by: str = "auto"
 ) -> dict:
-    """Issue a Stripe refund for the deposit. Idempotent.
-
-    Returns:
-        {
-            'refunded': bool,
-            'reason': str (only when refunded=False),
-            'refund_id': str | None,
-            'amount_cents': int | None,
-            'initiated_by': str,
-        }
-    """
+    """Issue a Stripe refund for the deposit. Idempotent."""
     if payment_manager.has_succeeded_refund(db, booking.id):
-        return {"refunded": False, "reason": "already_refunded", "initiated_by": initiated_by}
+        return {
+            "refunded": False,
+            "reason": "already_refunded",
+            "initiated_by": initiated_by,
+        }
 
     existing_pending = payment_manager.latest_pending_refund(db, booking.id)
     if existing_pending is not None:
-        return {"refunded": False, "reason": "pending_refund_exists", "initiated_by": initiated_by}
+        return {
+            "refunded": False,
+            "reason": "pending_refund_exists",
+            "initiated_by": initiated_by,
+        }
 
     deposit = payment_manager.deposit_succeeded_for_booking(db, booking.id)
     if deposit is None or not deposit.stripe_payment_intent_id:
-        return {"refunded": False, "reason": "no_paid_deposit", "initiated_by": initiated_by}
+        return {
+            "refunded": False,
+            "reason": "no_paid_deposit",
+            "initiated_by": initiated_by,
+        }
 
-    # Create the pending row first so the webhook always has somewhere to land.
     tx = payment_manager.create_pending_refund(
         db,
         booking_id=booking.id,
@@ -142,6 +156,106 @@ def refund_deposit_for_booking(
     }
 
 
+def _attempt_payout(db: Session, mover, tx: Transaction) -> bool:
+    """Attempt a single pending payout. Returns True if transferred."""
+    if not mover.stripe_connect_id or not mover.stripe_connect_payouts_enabled:
+        return False
+
+    try:
+        transfer = stripe_service.create_transfer(
+            account_id=mover.stripe_connect_id,
+            amount_cents=tx.amount_cents,
+            metadata={
+                "booking_id": str(tx.booking_id),
+                "payout_tx_id": str(tx.id),
+                "mover_id": str(mover.id),
+            },
+        )
+    except Exception as e:
+        print(f"[payout] transfer failed tx={tx.id} mover={mover.id}: {e}")
+        payment_manager.mark_payout_failed(db, tx.id)
+        notification_manager.create(
+            db,
+            user_id=mover.user_id,
+            kind="payout_failed",
+            title="Payout failed",
+            body=(
+                f"We couldn't send your payout for booking #{tx.booking_id}. "
+                "Support has been notified."
+            ),
+            data={"booking_id": tx.booking_id, "payout_tx_id": tx.id},
+        )
+        return False
+
+    payment_manager.mark_payout_succeeded(db, tx.id, transfer["id"])
+    notification_manager.create(
+        db,
+        user_id=mover.user_id,
+        kind="payout_sent",
+        title="Payout sent",
+        body=(
+            f"${(tx.amount_cents / 100):.2f} for booking #{tx.booking_id} "
+            "is on its way to your bank."
+        ),
+        data={"booking_id": tx.booking_id, "payout_tx_id": tx.id},
+    )
+    print(
+        f"[payout] sent tr={transfer['id']} tx={tx.id} "
+        f"mover={mover.id} amount={tx.amount_cents}"
+    )
+    return True
+
+
+def _attempt_pending_payouts_for_mover(db: Session, mover) -> None:
+    if not mover.stripe_connect_id or not mover.stripe_connect_payouts_enabled:
+        return
+    for tx in payment_manager.pending_payouts_for_mover(db, mover.id):
+        _attempt_payout(db, mover, tx)
+
+
+def _maybe_create_payout_for_booking(db: Session, booking) -> None:
+    """Create and attempt a payout after the final payment succeeds."""
+    if booking.mover_id is None:
+        return
+    mover = mover_manager.get_by_id(db, booking.mover_id)
+    if mover is None:
+        return
+
+    if (
+        payment_manager.payout_succeeded_for_booking(db, booking.id) is not None
+        or payment_manager.latest_pending_payout(db, booking.id) is not None
+    ):
+        return
+
+    amount = _mover_payout_cents(booking)
+    if amount <= 0:
+        return
+
+    tx = payment_manager.create_pending_payout(
+        db, booking_id=booking.id, amount_cents=amount
+    )
+
+    if not mover.stripe_connect_id or not mover.stripe_connect_payouts_enabled:
+        notification_manager.create(
+            db,
+            user_id=mover.user_id,
+            kind="payout_onboarding_required",
+            title="Set up payouts to get paid",
+            body=(
+                f"You have a ${(amount / 100):.2f} payout waiting for booking "
+                f"#{booking.id}. Complete Stripe onboarding to receive it."
+            ),
+            data={"booking_id": booking.id, "payout_tx_id": tx.id},
+        )
+        print(
+            f"[payout] pending onboarding for mover={mover.id} "
+            f"booking={booking.id} amount={amount}"
+        )
+        return
+
+    _attempt_payout(db, mover, tx)
+
+
 # ═══════════════════════════════════════════════════════════
 # Routes
 # ═══════════════════════════════════════════════════════════
@@ -174,7 +288,10 @@ def final(
     if booking.status != "completed":
         raise HTTPException(
             status_code=409,
-            detail=f"Final payment can only be made on completed bookings (current: {booking.status})",
+            detail=(
+                "Final payment can only be made on completed bookings "
+                f"(current: {booking.status})"
+            ),
         )
     if payment_manager.deposit_succeeded_for_booking(db, booking.id) is None:
         raise HTTPException(status_code=409, detail="Deposit has not been paid")
@@ -215,7 +332,10 @@ def final(
         raise HTTPException(status_code=502, detail="Could not create checkout session")
 
     payment_manager.create_pending_final(
-        db, booking_id=booking.id, amount_cents=remaining, session_id=session["id"]
+        db,
+        booking_id=booking.id,
+        amount_cents=remaining,
+        session_id=session["id"],
     )
     return {
         "booking": booking_manager.get_by_id(db, booking.id),
@@ -231,10 +351,7 @@ def refund(
     current_user: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> dict:
-    """Admin: refund the deposit for a booking. Idempotent.
-
-    Use cases: disputes, goodwill, correcting a bad auto-refund decision.
-    """
+    """Admin: refund the deposit for a booking. Idempotent."""
     booking = booking_manager.get_by_id(db, booking_id)
     if booking is None:
         raise HTTPException(status_code=404, detail="Booking not found")
@@ -264,9 +381,49 @@ def refund(
 
 
 @router.post("/connect/onboard")
-def connect_onboard():
-    """Stripe Connect Express onboarding. Implemented in Phase 5.4."""
-    raise HTTPException(status_code=501, detail="Not implemented until Phase 5.4")
+def connect_onboard(
+    current_user: User = Depends(require_mover),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Create (or reuse) a Stripe Express account and return an onboarding URL."""
+    mover = current_user.mover
+    if mover is None:
+        raise HTTPException(status_code=403, detail="Mover profile required")
+
+    if not mover.stripe_connect_id:
+        try:
+            account = stripe_service.create_express_account(
+                email=current_user.email,
+                country=settings.CONNECT_COUNTRY,
+            )
+        except RuntimeError as e:
+            raise HTTPException(status_code=503, detail=str(e))
+        except Exception as e:
+            print(f"[connect] account create failed mover={mover.id}: {e}")
+            raise HTTPException(
+                status_code=502, detail="Could not create Connect account"
+            )
+        mover = mover_manager.set_stripe_connect_account(
+            db, mover, account["id"]
+        )
+
+    try:
+        link = stripe_service.create_account_onboarding_link(
+            account_id=mover.stripe_connect_id,
+            refresh_url=settings.CONNECT_REFRESH_URL,
+            return_url=settings.CONNECT_RETURN_URL,
+        )
+    except Exception as e:
+        print(f"[connect] account link failed mover={mover.id}: {e}")
+        raise HTTPException(
+            status_code=502, detail="Could not create onboarding link"
+        )
+
+    return {
+        "url": link["url"],
+        "account_id": mover.stripe_connect_id,
+        "mover": serialize_mover(mover),
+    }
 
 
 # ═══════════════════════════════════════════════════════════
@@ -323,13 +480,22 @@ def _dispatch_event(db: Session, event_type: str, obj: dict) -> None:
     if event_type == "charge.refunded":
         _handle_charge_refunded(db, obj)
         return
+    if event_type == "account.updated":
+        _handle_account_updated(db, obj)
+        return
+    if event_type == "transfer.reversed":
+        _handle_transfer_reversed(db, obj)
+        return
     print(f"[stripe-webhook] unhandled event type {event_type} (ack)")
 
 
 def _handle_pi_succeeded(db: Session, pi: dict) -> None:
     booking_id = _booking_id_from_pi(db, pi["id"])
     if booking_id is None:
-        print(f"[stripe-webhook] no tx for pi {pi['id']} — checkout handler will process")
+        print(
+            f"[stripe-webhook] no tx for pi {pi['id']} — "
+            "checkout handler will process"
+        )
         return
     kind = (pi.get("metadata") or {}).get("kind")
     if kind == "final":
@@ -359,8 +525,8 @@ def _handle_charge_refunded(db: Session, charge: dict) -> None:
     tx = payment_manager.find_pending_refund_by_pi(db, pi_id)
     if tx is None:
         print(
-            f"[stripe-webhook] charge.refunded for pi {pi_id}: no pending refund tx — "
-            "already processed or manual"
+            f"[stripe-webhook] charge.refunded for pi {pi_id}: "
+            "no pending refund tx — already processed or manual"
         )
         return
 
@@ -384,14 +550,83 @@ def _handle_charge_refunded(db: Session, charge: dict) -> None:
         )
 
     print(
-        f"[stripe-webhook] refund for booking {booking.id if booking else '?'} "
-        f"(pi {pi_id}) → succeeded"
+        f"[stripe-webhook] refund for booking "
+        f"{booking.id if booking else '?'} (pi {pi_id}) → succeeded"
     )
 
 
-def _booking_id_from_pi(db: Session, payment_intent_id: str) -> int | None:
-    from app.models.transaction import Transaction
+def _handle_account_updated(db: Session, account: dict) -> None:
+    account_id = account.get("id")
+    if not account_id:
+        return
+    mover = mover_manager.get_by_stripe_connect_id(db, account_id)
+    if mover is None:
+        print(
+            f"[stripe-webhook] account.updated for unknown connect id {account_id} — skip"
+        )
+        return
 
+    charges_enabled = bool(account.get("charges_enabled"))
+    payouts_enabled = bool(account.get("payouts_enabled"))
+    details_submitted = bool(account.get("details_submitted"))
+
+    mover = mover_manager.update_connect_status(
+        db,
+        mover,
+        charges_enabled=charges_enabled,
+        payouts_enabled=payouts_enabled,
+        details_submitted=details_submitted,
+    )
+
+    if payouts_enabled and mover.stripe_connect_onboarded_at is None:
+        mover.stripe_connect_onboarded_at = datetime.now(timezone.utc)
+        db.commit()
+        db.refresh(mover)
+
+    print(
+        f"[stripe-webhook] account.updated mover={mover.id} "
+        f"charges={charges_enabled} payouts={payouts_enabled} "
+        f"details={details_submitted}"
+    )
+
+    if payouts_enabled:
+        _attempt_pending_payouts_for_mover(db, mover)
+
+
+def _handle_transfer_reversed(db: Session, transfer: dict) -> None:
+    metadata = transfer.get("metadata") or {}
+    payout_tx_id = metadata.get("payout_tx_id")
+    if not payout_tx_id:
+        print("[stripe-webhook] transfer.reversed without payout_tx_id — skip")
+        return
+
+    try:
+        tx_id = int(payout_tx_id)
+    except (TypeError, ValueError):
+        return
+
+    tx = db.query(Transaction).filter(Transaction.id == tx_id).first()
+    if tx is None or tx.status == "failed":
+        return
+
+    payment_manager.mark_payout_failed(db, tx.id)
+    booking = booking_manager.get_by_id(db, tx.booking_id)
+    if booking and booking.mover:
+        notification_manager.create(
+            db,
+            user_id=booking.mover.user_id,
+            kind="payout_reversed",
+            title="Payout reversed",
+            body=(
+                f"A payout for booking #{booking.id} was reversed by Stripe. "
+                "Contact support."
+            ),
+            data={"booking_id": booking.id, "payout_tx_id": tx.id},
+        )
+    print(f"[stripe-webhook] transfer.reversed tx={tx.id} booking={tx.booking_id}")
+
+
+def _booking_id_from_pi(db: Session, payment_intent_id: str) -> int | None:
     tx = (
         db.query(Transaction)
         .filter(
@@ -436,7 +671,10 @@ def _handle_deposit_paid(db: Session, booking, session: dict) -> None:
         db, booking_id=booking.id, payment_intent_id=session.get("payment_intent")
     )
     if booking.status != "draft":
-        print(f"[stripe-webhook] booking {booking.id} already {booking.status} — no-op")
+        print(
+            f"[stripe-webhook] booking {booking.id} already "
+            f"{booking.status} — no-op"
+        )
         return
     booking = booking_manager.set_status(db, booking, "pending")
 
@@ -453,7 +691,8 @@ def _handle_deposit_paid(db: Session, booking, session: dict) -> None:
             data={"booking_id": booking.id},
         )
     print(
-        f"[stripe-webhook] booking {booking.id} → pending; notified {len(matches)} movers"
+        f"[stripe-webhook] booking {booking.id} → pending; "
+        f"notified {len(matches)} movers"
     )
 
 
@@ -461,6 +700,7 @@ def _handle_final_paid(db: Session, booking, session: dict) -> None:
     payment_manager.mark_final_succeeded(
         db, booking_id=booking.id, payment_intent_id=session.get("payment_intent")
     )
+
     if booking.client:
         notification_manager.create(
             db,
@@ -479,4 +719,6 @@ def _handle_final_paid(db: Session, booking, session: dict) -> None:
             body=f"Booking #{booking.id} is fully paid.",
             data={"booking_id": booking.id},
         )
+
+    _maybe_create_payout_for_booking(db, booking)
     print(f"[stripe-webhook] booking {booking.id} final payment → succeeded")

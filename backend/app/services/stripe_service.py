@@ -12,6 +12,8 @@ def _ensure_configured() -> None:
     stripe.api_key = settings.STRIPE_SECRET_KEY
 
 
+# ── Checkout ─────────────────────────────────────────────
+
 def _create_checkout_session(
     *,
     booking_id: int,
@@ -35,8 +37,12 @@ def _create_checkout_session(
                 "quantity": 1,
             }
         ],
-        success_url=f"{settings.CHECKOUT_SUCCESS_URL}&booking_id={booking_id}&kind={kind}",
-        cancel_url=f"{settings.CHECKOUT_CANCEL_URL}&booking_id={booking_id}&kind={kind}",
+        success_url=(
+            f"{settings.CHECKOUT_SUCCESS_URL}&booking_id={booking_id}&kind={kind}"
+        ),
+        cancel_url=(
+            f"{settings.CHECKOUT_CANCEL_URL}&booking_id={booking_id}&kind={kind}"
+        ),
         client_reference_id=str(booking_id),
         metadata={"booking_id": str(booking_id), "kind": kind},
         payment_intent_data={"metadata": pi_metadata},
@@ -59,8 +65,8 @@ def create_deposit_checkout_session(
 ) -> dict:
     """Checkout Session for the refundable deposit.
 
-    NOTE: do NOT pass payment_method_types — removed from the Checkout
-    Sessions API in the 2026-09-30 release.
+    Do NOT pass payment_method_types — removed from the Checkout Sessions
+    API in the 2026-09-30 release.
     """
     return _create_checkout_session(
         booking_id=booking_id,
@@ -99,15 +105,14 @@ def retrieve_checkout_session(session_id: str) -> dict:
     }
 
 
+# ── Refunds ──────────────────────────────────────────────
+
 def refund_payment_intent(
     payment_intent_id: str,
     amount_cents: Optional[int] = None,
     reason: Optional[str] = None,
 ) -> dict:
-    """Refund a PaymentIntent. Full refund when amount_cents is None.
-
-    `reason` must be one of: duplicate | fraudulent | requested_by_customer
-    """
+    """Refund a PaymentIntent. Full refund when amount_cents is None."""
     _ensure_configured()
     params: dict = {"payment_intent": payment_intent_id}
     if amount_cents is not None:
@@ -122,6 +127,83 @@ def refund_payment_intent(
         "payment_intent": refund.get("payment_intent"),
     }
 
+
+# ── Connect ──────────────────────────────────────────────
+
+def create_express_account(*, email: str, country: Optional[str] = None) -> dict:
+    """Create a Stripe Connect Express account for a mover.
+
+    Only the `transfers` capability is requested because MaatMovers charges
+    on the platform account. Express onboarding collects KYC/bank details.
+    """
+    _ensure_configured()
+    account = stripe.Account.create(
+        type="express",
+        country=country or settings.CONNECT_COUNTRY,
+        email=email,
+        capabilities={"transfers": {"requested": True}},
+        business_type="individual",
+        metadata={"platform": "maatmovers"},
+    )
+    return {
+        "id": account["id"],
+        "charges_enabled": bool(account.get("charges_enabled")),
+        "payouts_enabled": bool(account.get("payouts_enabled")),
+        "details_submitted": bool(account.get("details_submitted")),
+    }
+
+
+def create_account_onboarding_link(
+    *,
+    account_id: str,
+    refresh_url: Optional[str] = None,
+    return_url: Optional[str] = None,
+) -> dict:
+    """Create a single-use Stripe-hosted onboarding link for an Express account."""
+    _ensure_configured()
+    link = stripe.AccountLink.create(
+        account=account_id,
+        refresh_url=refresh_url or settings.CONNECT_REFRESH_URL,
+        return_url=return_url or settings.CONNECT_RETURN_URL,
+        type="account_onboarding",
+    )
+    return {"url": link["url"], "expires_at": link.get("expires_at")}
+
+
+def retrieve_account(account_id: str) -> dict:
+    _ensure_configured()
+    account = stripe.Account.retrieve(account_id)
+    return {
+        "id": account["id"],
+        "charges_enabled": bool(account.get("charges_enabled")),
+        "payouts_enabled": bool(account.get("payouts_enabled")),
+        "details_submitted": bool(account.get("details_submitted")),
+    }
+
+
+def create_transfer(
+    *,
+    account_id: str,
+    amount_cents: int,
+    currency: str = "usd",
+    metadata: Optional[dict] = None,
+) -> dict:
+    """Move funds from the platform balance to a connected Express account."""
+    _ensure_configured()
+    transfer = stripe.Transfer.create(
+        destination=account_id,
+        amount=amount_cents,
+        currency=currency,
+        metadata=metadata or {},
+    )
+    return {
+        "id": transfer["id"],
+        "amount": transfer["amount"],
+        "destination": transfer.get("destination"),
+    }
+
+
+# ── Webhook ─────────────────────────────────────────────
 
 def construct_webhook_event(payload: bytes, signature: str) -> dict:
     if not settings.STRIPE_WEBHOOK_SECRET:

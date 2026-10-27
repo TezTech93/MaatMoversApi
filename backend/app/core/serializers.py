@@ -1,11 +1,12 @@
 """Response serializers. Routers return plain dicts; these functions produce them."""
 import json
-from app.models.user import User
-from app.models.mover import Mover
-from app.models.client import Client
-from app.models.service import Service
+
 from app.models.booking import Booking
+from app.models.client import Client
+from app.models.mover import Mover
 from app.models.notification import Notification
+from app.models.service import Service
+from app.models.user import User
 
 
 def _iso(dt):
@@ -41,6 +42,10 @@ def serialize_mover(m: Mover) -> dict:
         "bio": m.bio,
         "verification_status": m.verification_status,
         "stripe_connect_id": m.stripe_connect_id,
+        "stripe_connect_charges_enabled": m.stripe_connect_charges_enabled,
+        "stripe_connect_payouts_enabled": m.stripe_connect_payouts_enabled,
+        "stripe_connect_details_submitted": m.stripe_connect_details_submitted,
+        "stripe_connect_onboarded_at": _iso(m.stripe_connect_onboarded_at),
         "created_at": _iso(m.created_at),
     }
 

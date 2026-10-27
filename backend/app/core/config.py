@@ -34,5 +34,13 @@ class Settings(BaseSettings):
     CHECKOUT_SUCCESS_URL: str = "http://localhost:8081/?checkout=success"
     CHECKOUT_CANCEL_URL: str = "http://localhost:8081/?checkout=cancel"
 
+    # Stripe Connect
+    CONNECT_COUNTRY: str = "US"
+    CONNECT_RETURN_URL: str = "http://localhost:8081/?connect=return"
+    CONNECT_REFRESH_URL: str = "http://localhost:8081/?connect=refresh"
+
+    # Marketplace economics
+    PLATFORM_FEE_BPS: int = 1500
+
 
 settings = Settings()

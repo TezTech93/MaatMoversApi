@@ -14,6 +14,7 @@ class Transaction(Base):
     booking_id = Column(Integer, ForeignKey("bookings.id"), nullable=False, index=True)
     stripe_payment_intent_id = Column(String(128), nullable=True, index=True)
     stripe_checkout_session_id = Column(String(128), nullable=True, index=True)
+    stripe_transfer_id = Column(String(128), nullable=True, index=True)
     amount_cents = Column(Integer, nullable=False)
     currency = Column(String(8), nullable=False, default="usd")
     kind = Column(String(16), nullable=False)
@@ -21,8 +22,11 @@ class Transaction(Base):
     created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
 
     __table_args__ = (
-        CheckConstraint("kind in ('deposit','final','refund','payout')", name="ck_tx_kind"),
         CheckConstraint(
-            "status in ('pending','succeeded','failed','refunded')", name="ck_tx_status"
+            "kind in ('deposit','final','refund','payout')", name="ck_tx_kind"
+        ),
+        CheckConstraint(
+            "status in ('pending','succeeded','failed','refunded')",
+            name="ck_tx_status",
         ),
     )

@@ -2,6 +2,7 @@
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.models.booking import Booking
 from app.models.processed_event import ProcessedEvent
 from app.models.transaction import Transaction
 
@@ -165,8 +166,6 @@ def mark_final_failed(db: Session, payment_intent_id: str) -> Transaction | None
 def create_pending_refund(
     db: Session, *, booking_id: int, amount_cents: int, payment_intent_id: str
 ) -> Transaction:
-    """Create a pending refund row. Sets stripe_payment_intent_id to the
-    deposit's PI so charge.refunded can locate this row."""
     tx = Transaction(
         booking_id=booking_id,
         amount_cents=amount_cents,
@@ -233,6 +232,88 @@ def mark_refund_succeeded(db: Session, tx_id: int) -> Transaction | None:
 
 
 def mark_refund_failed(db: Session, tx_id: int) -> Transaction | None:
+    tx = db.query(Transaction).filter(Transaction.id == tx_id).first()
+    if tx is None:
+        return None
+    tx.status = "failed"
+    db.commit()
+    db.refresh(tx)
+    return tx
+
+
+# ── Payouts (mover transfers) ───────────────────────────
+
+def create_pending_payout(
+    db: Session, *, booking_id: int, amount_cents: int
+) -> Transaction:
+    tx = Transaction(
+        booking_id=booking_id,
+        amount_cents=amount_cents,
+        currency="usd",
+        kind="payout",
+        status="pending",
+    )
+    db.add(tx)
+    db.commit()
+    db.refresh(tx)
+    return tx
+
+
+def latest_pending_payout(db: Session, booking_id: int) -> Transaction | None:
+    return (
+        db.query(Transaction)
+        .filter(
+            Transaction.booking_id == booking_id,
+            Transaction.kind == "payout",
+            Transaction.status == "pending",
+        )
+        .order_by(Transaction.id.desc())
+        .first()
+    )
+
+
+def payout_succeeded_for_booking(db: Session, booking_id: int) -> Transaction | None:
+    return (
+        db.query(Transaction)
+        .filter(
+            Transaction.booking_id == booking_id,
+            Transaction.kind == "payout",
+            Transaction.status == "succeeded",
+        )
+        .order_by(Transaction.id.desc())
+        .first()
+    )
+
+
+def pending_payouts_for_mover(db: Session, mover_id: int):
+    return (
+        db.query(Transaction)
+        .join(Booking, Booking.id == Transaction.booking_id)
+        .filter(
+            Transaction.kind == "payout",
+            Transaction.status == "pending",
+            Booking.mover_id == mover_id,
+        )
+        .order_by(Transaction.id.asc())
+        .all()
+    )
+
+
+def mark_payout_succeeded(
+    db: Session, tx_id: int, transfer_id: str | None
+) -> Transaction | None:
+    tx = db.query(Transaction).filter(Transaction.id == tx_id).first()
+    if tx is None:
+        return None
+    tx.status = "succeeded"
+    if transfer_id:
+        tx.stripe_transfer_id = transfer_id
+    db.commit()
+    db.refresh(tx)
+    return tx
+
+
+def mark_payout_failed(db: Session, tx_id: int) -> Transaction | None:
     tx = db.query(Transaction).filter(Transaction.id == tx_id).first()
     if tx is None:
         return None
