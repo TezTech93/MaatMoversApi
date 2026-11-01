@@ -4,6 +4,10 @@ Phase 5.1: deposit checkout + webhook.
 Phase 5.2: final payment checkout + webhook branching.
 Phase 5.3: refunds (auto-on-cancel + admin manual) + charge.refunded webhook.
 Phase 5.4: Connect Express onboarding, transfers/payouts, account.updated.
+
+Webhook routing:
+  /payments/webhook       ← v1 snapshot events (STRIPE_WEBHOOK_SECRET)
+  /payments/webhook-thin  ← v2 thin events     (STRIPE_WEBHOOK_THIN_SECRET)
 """
 from datetime import datetime, timezone
 
@@ -29,7 +33,7 @@ router = APIRouter(prefix="/payments", tags=["payments"])
 
 
 # ═══════════════════════════════════════════════════════════
-# Helpers
+# Shared helpers
 # ═══════════════════════════════════════════════════════════
 
 def _platform_fee_cents(total_cents: int) -> int:
@@ -79,7 +83,9 @@ def _create_deposit_checkout(*, booking, current_user: User, db: Session) -> dic
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         print(f"[payments] stripe session create failed: {e}")
-        raise HTTPException(status_code=502, detail="Could not create checkout session")
+        raise HTTPException(
+            status_code=502, detail="Could not create checkout session"
+        )
 
     payment_manager.create_pending_deposit(
         db,
@@ -270,7 +276,9 @@ def deposit(
     booking = booking_manager.get_by_id(db, booking_id)
     if booking is None:
         raise HTTPException(status_code=404, detail="Booking not found")
-    return _create_deposit_checkout(booking=booking, current_user=current_user, db=db)
+    return _create_deposit_checkout(
+        booking=booking, current_user=current_user, db=db
+    )
 
 
 @router.post("/final/{booking_id}")
@@ -329,7 +337,9 @@ def final(
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         print(f"[payments] stripe final session create failed: {e}")
-        raise HTTPException(status_code=502, detail="Could not create checkout session")
+        raise HTTPException(
+            status_code=502, detail="Could not create checkout session"
+        )
 
     payment_manager.create_pending_final(
         db,
@@ -359,9 +369,13 @@ def refund(
     if payment_manager.has_succeeded_refund(db, booking.id):
         raise HTTPException(status_code=409, detail="Deposit already refunded")
     if payment_manager.latest_pending_refund(db, booking.id) is not None:
-        raise HTTPException(status_code=409, detail="A refund is already in progress")
+        raise HTTPException(
+            status_code=409, detail="A refund is already in progress"
+        )
     if payment_manager.deposit_succeeded_for_booking(db, booking.id) is None:
-        raise HTTPException(status_code=409, detail="No succeeded deposit to refund")
+        raise HTTPException(
+            status_code=409, detail="No succeeded deposit to refund"
+        )
 
     result = refund_deposit_for_booking(db, booking, initiated_by="admin")
     if not result.get("refunded"):
@@ -427,40 +441,69 @@ def connect_onboard(
 
 
 # ═══════════════════════════════════════════════════════════
-# Webhook
+# Webhook — v1 snapshot at /payments/webhook
+#           v2 thin   at /payments/webhook-thin
 # ═══════════════════════════════════════════════════════════
 
 @router.post("/webhook")
-async def webhook(request: Request, db: Session = Depends(get_db)) -> dict:
-    """Stripe webhook receiver. Single source of truth for payment state."""
+async def webhook_v1(request: Request, db: Session = Depends(get_db)) -> dict:
+    """Stripe snapshot (v1) webhook receiver."""
+    return await _process_webhook(
+        request, db, settings.STRIPE_WEBHOOK_SECRET, label="v1"
+    )
+
+
+@router.post("/webhook-thin")
+async def webhook_v2_thin(request: Request, db: Session = Depends(get_db)) -> dict:
+    """Stripe thin (v2) webhook receiver."""
+    return await _process_webhook(
+        request, db, settings.STRIPE_WEBHOOK_THIN_SECRET, label="v2-thin"
+    )
+
+
+async def _process_webhook(
+    request: Request, db: Session, secret: str, label: str
+) -> dict:
+    """Shared webhook processing for both v1 and v2 event streams."""
     payload = await request.body()
     sig_header = request.headers.get("stripe-signature")
     if not sig_header:
         raise HTTPException(status_code=400, detail="Missing Stripe-Signature header")
 
     try:
-        event = stripe_service.construct_webhook_event(payload, sig_header)
+        event = stripe_service.construct_webhook_event(payload, sig_header, secret)
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
-        print(f"[stripe-webhook] signature verification failed: {e}")
+        print(f"[stripe-webhook-{label}] signature verification failed: {e}")
         raise HTTPException(status_code=400, detail="Invalid signature")
 
     event_id = event["id"]
     event_type = event["type"]
 
     if not payment_manager.try_claim_event(db, event_id, event_type):
-        print(f"[stripe-webhook] duplicate event {event_id} ({event_type}) — ack")
+        print(
+            f"[stripe-webhook-{label}] duplicate event {event_id} "
+            f"({event_type}) — ack"
+        )
         return {"received": True, "duplicate": True}
 
+    # v1 snapshot events include data.object (full resource).
+    # v2 thin events include related_object at top level and no data.object.
+    data = event.get("data") or {}
+    obj = data.get("object") or data.get("account") or {}
+    related = event.get("related_object")
+    if related and "related_object" not in obj:
+        obj = {**obj, "related_object": related}
+
     try:
-        _dispatch_event(db, event_type, event["data"]["object"])
+        _dispatch_event(db, event_type, obj)
     except Exception as e:
-        print(f"[stripe-webhook] handler failed for {event_id}: {e}")
+        print(f"[stripe-webhook-{label}] handler failed for {event_id}: {e}")
         payment_manager.release_event(db, event_id)
         raise HTTPException(status_code=500, detail="Webhook handler failed")
 
-    print(f"[stripe-webhook] processed {event_type} {event_id}")
+    print(f"[stripe-webhook-{label}] processed {event_type} {event_id}")
     return {"received": True}
 
 
@@ -480,7 +523,7 @@ def _dispatch_event(db: Session, event_type: str, obj: dict) -> None:
     if event_type == "charge.refunded":
         _handle_charge_refunded(db, obj)
         return
-    if event_type == "account.updated":
+    if event_type in ("account.updated", "v2.core.account.updated"):
         _handle_account_updated(db, obj)
         return
     if event_type == "transfer.reversed":
@@ -555,14 +598,30 @@ def _handle_charge_refunded(db: Session, charge: dict) -> None:
     )
 
 
-def _handle_account_updated(db: Session, account: dict) -> None:
-    account_id = account.get("id")
+def _handle_account_updated(db: Session, obj: dict) -> None:
+    """Handle account status changes from either v1 snapshot or v2 thin events.
+
+    For v1, `obj` is the full account — fields are available directly.
+    For v2 thin, `obj` may only contain related_object; we always fetch
+    the canonical state via retrieve_account() so we never act on
+    stale or differently-shaped payloads.
+    """
+    account_id = obj.get("id") or (obj.get("related_object") or {}).get("id")
     if not account_id:
+        print("[stripe-webhook] account.updated without account id — skip")
         return
+
+    try:
+        account = stripe_service.retrieve_account(account_id)
+    except Exception as e:
+        print(f"[stripe-webhook] account retrieve failed {account_id}: {e}")
+        return
+
     mover = mover_manager.get_by_stripe_connect_id(db, account_id)
     if mover is None:
         print(
-            f"[stripe-webhook] account.updated for unknown connect id {account_id} — skip"
+            f"[stripe-webhook] account.updated for unknown connect id "
+            f"{account_id} — skip"
         )
         return
 
@@ -623,7 +682,10 @@ def _handle_transfer_reversed(db: Session, transfer: dict) -> None:
             ),
             data={"booking_id": booking.id, "payout_tx_id": tx.id},
         )
-    print(f"[stripe-webhook] transfer.reversed tx={tx.id} booking={tx.booking_id}")
+    print(
+        f"[stripe-webhook] transfer.reversed tx={tx.id} "
+        f"booking={tx.booking_id}"
+    )
 
 
 def _booking_id_from_pi(db: Session, payment_intent_id: str) -> int | None:
@@ -641,7 +703,9 @@ def _booking_id_from_pi(db: Session, payment_intent_id: str) -> int | None:
 def _handle_checkout_completed(db: Session, session: dict) -> None:
     metadata = session.get("metadata") or {}
     kind = metadata.get("kind") or "deposit"
-    booking_id_raw = metadata.get("booking_id") or session.get("client_reference_id")
+    booking_id_raw = metadata.get("booking_id") or session.get(
+        "client_reference_id"
+    )
     if not booking_id_raw:
         print("[stripe-webhook] checkout session missing booking_id — skip")
         return
@@ -652,7 +716,9 @@ def _handle_checkout_completed(db: Session, session: dict) -> None:
         return
 
     if session.get("payment_status") != "paid":
-        print(f"[stripe-webhook] checkout {session.get('id')} not paid yet — wait")
+        print(
+            f"[stripe-webhook] checkout {session.get('id')} not paid yet — wait"
+        )
         return
 
     booking = booking_manager.get_by_id(db, booking_id)
@@ -668,7 +734,9 @@ def _handle_checkout_completed(db: Session, session: dict) -> None:
 
 def _handle_deposit_paid(db: Session, booking, session: dict) -> None:
     payment_manager.mark_deposit_succeeded(
-        db, booking_id=booking.id, payment_intent_id=session.get("payment_intent")
+        db,
+        booking_id=booking.id,
+        payment_intent_id=session.get("payment_intent"),
     )
     if booking.status != "draft":
         print(
@@ -698,7 +766,9 @@ def _handle_deposit_paid(db: Session, booking, session: dict) -> None:
 
 def _handle_final_paid(db: Session, booking, session: dict) -> None:
     payment_manager.mark_final_succeeded(
-        db, booking_id=booking.id, payment_intent_id=session.get("payment_intent")
+        db,
+        booking_id=booking.id,
+        payment_intent_id=session.get("payment_intent"),
     )
 
     if booking.client:

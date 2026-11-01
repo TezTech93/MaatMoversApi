@@ -28,9 +28,12 @@ class Settings(BaseSettings):
     SMTP_FROM: str = ""
     SMTP_TLS: bool = True
 
-    # Stripe
+    # Stripe (v1 snapshot webhook secret)
     STRIPE_SECRET_KEY: str = ""
     STRIPE_WEBHOOK_SECRET: str = ""
+    # Stripe (v2 thin webhook secret)
+    STRIPE_WEBHOOK_THIN_SECRET: str = ""
+
     CHECKOUT_SUCCESS_URL: str = "http://localhost:8081/?checkout=success"
     CHECKOUT_CANCEL_URL: str = "http://localhost:8081/?checkout=cancel"
 

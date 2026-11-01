@@ -1,5 +1,5 @@
 """User model — the single source of identity for both sides of the marketplace."""
-from sqlalchemy import Boolean, CheckConstraint, Column, DateTime, Integer, String
+from sqlalchemy import Boolean, CheckConstraint, Column, DateTime, Integer, String, Text
 from sqlalchemy.orm import relationship
 
 from app.core.database import Base
@@ -7,7 +7,13 @@ from app.models.mixins import utcnow
 
 
 class User(Base):
-    """An authenticated account."""
+    """An authenticated account.
+
+    Roles:
+      - client / mover — signup roles
+      - manager       — admin-panel user with a per-account `permissions` list
+      - admin         — supreme admin; bypasses permission checks
+    """
 
     __tablename__ = "users"
 
@@ -16,18 +22,23 @@ class User(Base):
     username = Column(String(30), unique=True, nullable=False, index=True)
     password_hash = Column(String(255), nullable=False)
     role = Column(String(16), nullable=False)
+    permissions = Column(Text, nullable=False, default="[]")
     phone = Column(String(32), nullable=True)
     is_active = Column(Boolean, nullable=False, default=True)
     strikes = Column(Integer, nullable=False, default=0)
     is_blocked = Column(Boolean, nullable=False, default=False)
     created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
-    updated_at = Column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+    updated_at = Column(
+        DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow
+    )
 
     mover = relationship("Mover", back_populates="user", uselist=False)
     client = relationship("Client", back_populates="user", uselist=False)
 
     __table_args__ = (
-        CheckConstraint("role in ('client','mover','admin')", name="ck_users_role"),
+        CheckConstraint(
+            "role in ('client','mover','manager','admin')", name="ck_users_role"
+        ),
     )
 
     def __repr__(self) -> str:  # pragma: no cover

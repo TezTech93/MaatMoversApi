@@ -1,9 +1,15 @@
 """Stripe client + high-level helpers. All Stripe calls go through here."""
+import json
 from typing import Optional
 
+import requests
 import stripe
 
 from app.core.config import settings
+
+
+STRIPE_API_BASE = "https://api.stripe.com"
+STRIPE_API_VERSION = "2026-10-28.endive"
 
 
 def _ensure_configured() -> None:
@@ -12,7 +18,7 @@ def _ensure_configured() -> None:
     stripe.api_key = settings.STRIPE_SECRET_KEY
 
 
-# ── Checkout ─────────────────────────────────────────────
+# ── Checkout (v1) ────────────────────────────────────────
 
 def _create_checkout_session(
     *,
@@ -105,7 +111,7 @@ def retrieve_checkout_session(session_id: str) -> dict:
     }
 
 
-# ── Refunds ──────────────────────────────────────────────
+# ── Refunds (v1) ─────────────────────────────────────────
 
 def refund_payment_intent(
     payment_intent_id: str,
@@ -128,23 +134,139 @@ def refund_payment_intent(
     }
 
 
-# ── Connect ──────────────────────────────────────────────
+# ── Connect (v2) ─────────────────────────────────────────
+
+def _v2_headers() -> dict:
+    _ensure_configured()
+    return {
+        "Authorization": f"Bearer {settings.STRIPE_SECRET_KEY}",
+        "Stripe-Version": STRIPE_API_VERSION,
+        "Content-Type": "application/json",
+    }
+
 
 def create_express_account(*, email: str, country: Optional[str] = None) -> dict:
-    """Create a Stripe Connect Express account for a mover.
+    """Create a Stripe Connect account via the Accounts v2 API.
 
-    Only the `transfers` capability is requested because MaatMovers charges
-    on the platform account. Express onboarding collects KYC/bank details.
+    Self-serve fallback: full dashboard + Stripe-collected fees and losses.
+    Express + application/application is preferred but requires
+    platform-managed-risk approval; see the Stripe Dashboard Connect settings.
     """
-    _ensure_configured()
-    account = stripe.Account.create(
-        type="express",
-        country=country or settings.CONNECT_COUNTRY,
-        email=email,
-        capabilities={"transfers": {"requested": True}},
-        business_type="individual",
-        metadata={"platform": "maatmovers"},
+    body = {
+        "contact_email": email,
+        "identity": {"country": country or settings.CONNECT_COUNTRY},
+        "dashboard": "full",
+        "defaults": {
+            "responsibilities": {
+                "fees_collector": "stripe",
+                "losses_collector": "stripe",
+            }
+        },
+        "configuration": {
+            "merchant": {
+                "capabilities": {
+                    "card_payments": {"requested": True}
+                }
+            },
+            "recipient": {
+                "capabilities": {
+                    "stripe_balance": {
+                        "stripe_transfers": {"requested": True}
+                    }
+                }
+            },
+        },
+        "metadata": {"platform": "maatmovers"},
+    }
+    resp = requests.post(
+        f"{STRIPE_API_BASE}/v2/core/accounts",
+        headers=_v2_headers(),
+        data=json.dumps(body),
+        timeout=10,
     )
+    if not resp.ok:
+        raise RuntimeError(
+            f"Stripe v2 account create failed ({resp.status_code}): {resp.text}"
+        )
+    account = resp.json()
+    return {
+        "id": account["id"],
+        "charges_enabled": bool(account.get("charges_enabled")),
+        "payouts_enabled": bool(account.get("payouts_enabled")),
+        "details_submitted": bool(account.get("details_submitted")),
+    }
+    """Create a Stripe Connect Express account via the Accounts v2 API."""
+    body = {
+        "contact_email": email,
+        "identity": {"country": country or settings.CONNECT_COUNTRY},
+        "dashboard": "express",
+        "defaults": {
+            "responsibilities": {
+                "fees_collector": "application",
+                "losses_collector": "stripe",   # ← changed from "application"
+            }
+        },
+        "configuration": {
+            "recipient": {
+                "capabilities": {
+                    "stripe_balance": {
+                        "stripe_transfers": {"requested": True}
+                    }
+                }
+            }
+        },
+        "metadata": {"platform": "maatmovers"},
+    }
+    resp = requests.post(
+        f"{STRIPE_API_BASE}/v2/core/accounts",
+        headers=_v2_headers(),
+        data=json.dumps(body),
+        timeout=10,
+    )
+    if not resp.ok:
+        raise RuntimeError(
+            f"Stripe v2 account create failed ({resp.status_code}): {resp.text}"
+        )
+    account = resp.json()
+    return {
+        "id": account["id"],
+        "charges_enabled": bool(account.get("charges_enabled")),
+        "payouts_enabled": bool(account.get("payouts_enabled")),
+        "details_submitted": bool(account.get("details_submitted")),
+    }
+    """Create a Stripe Connect Express account via the Accounts v2 API."""
+    body = {
+        "contact_email": email,
+        "identity": {"country": country or settings.CONNECT_COUNTRY},
+        "dashboard": "express",
+        "defaults": {
+            "responsibilities": {
+                "fees_collector": "application",
+                "losses_collector": "application",
+            }
+        },
+        "configuration": {
+            "recipient": {
+                "capabilities": {
+                    "stripe_balance": {
+                        "stripe_transfers": {"requested": True}
+                    }
+                }
+            }
+        },
+        "metadata": {"platform": "maatmovers"},
+    }
+    resp = requests.post(
+        f"{STRIPE_API_BASE}/v2/core/accounts",
+        headers=_v2_headers(),
+        data=json.dumps(body),
+        timeout=10,
+    )
+    if not resp.ok:
+        raise RuntimeError(
+            f"Stripe v2 account create failed ({resp.status_code}): {resp.text}"
+        )
+    account = resp.json()
     return {
         "id": account["id"],
         "charges_enabled": bool(account.get("charges_enabled")),
@@ -159,20 +281,72 @@ def create_account_onboarding_link(
     refresh_url: Optional[str] = None,
     return_url: Optional[str] = None,
 ) -> dict:
-    """Create a single-use Stripe-hosted onboarding link for an Express account."""
-    _ensure_configured()
-    link = stripe.AccountLink.create(
-        account=account_id,
-        refresh_url=refresh_url or settings.CONNECT_REFRESH_URL,
-        return_url=return_url or settings.CONNECT_RETURN_URL,
-        type="account_onboarding",
+    """Create a single-use Stripe-hosted onboarding link via Accounts v2.
+
+    NOTE: do NOT pass "configurations" — removed from the v2 Account Links
+    API in the 2026-09-30 version. Stripe determines required
+    configurations automatically from the Account's own config.
+    """
+    body = {
+        "account": account_id,
+        "use_case": {
+            "type": "account_onboarding",
+            "account_onboarding": {
+                "refresh_url": refresh_url or settings.CONNECT_REFRESH_URL,
+                "return_url": return_url or settings.CONNECT_RETURN_URL,
+            },
+        },
+    }
+    resp = requests.post(
+        f"{STRIPE_API_BASE}/v2/core/account_links",
+        headers=_v2_headers(),
+        data=json.dumps(body),
+        timeout=10,
     )
+    if not resp.ok:
+        raise RuntimeError(
+            f"Stripe v2 account link failed ({resp.status_code}): {resp.text}"
+        )
+    link = resp.json()
+    return {"url": link["url"], "expires_at": link.get("expires_at")}
+    """Create a single-use Stripe-hosted onboarding link via Accounts v2."""
+    body = {
+        "account": account_id,
+        "use_case": {
+            "type": "account_onboarding",
+            "account_onboarding": {
+                "configurations": ["recipient"],
+                "refresh_url": refresh_url or settings.CONNECT_REFRESH_URL,
+                "return_url": return_url or settings.CONNECT_RETURN_URL,
+            },
+        },
+    }
+    resp = requests.post(
+        f"{STRIPE_API_BASE}/v2/core/account_links",
+        headers=_v2_headers(),
+        data=json.dumps(body),
+        timeout=10,
+    )
+    if not resp.ok:
+        raise RuntimeError(
+            f"Stripe v2 account link failed ({resp.status_code}): {resp.text}"
+        )
+    link = resp.json()
     return {"url": link["url"], "expires_at": link.get("expires_at")}
 
 
 def retrieve_account(account_id: str) -> dict:
-    _ensure_configured()
-    account = stripe.Account.retrieve(account_id)
+    """Retrieve a v2 account's current status."""
+    resp = requests.get(
+        f"{STRIPE_API_BASE}/v2/core/accounts/{account_id}",
+        headers=_v2_headers(),
+        timeout=10,
+    )
+    if not resp.ok:
+        raise RuntimeError(
+            f"Stripe v2 account retrieve failed ({resp.status_code}): {resp.text}"
+        )
+    account = resp.json()
     return {
         "id": account["id"],
         "charges_enabled": bool(account.get("charges_enabled")),
@@ -205,9 +379,12 @@ def create_transfer(
 
 # ── Webhook ─────────────────────────────────────────────
 
-def construct_webhook_event(payload: bytes, signature: str) -> dict:
-    if not settings.STRIPE_WEBHOOK_SECRET:
-        raise RuntimeError("STRIPE_WEBHOOK_SECRET is not configured")
-    return stripe.Webhook.construct_event(
-        payload, signature, settings.STRIPE_WEBHOOK_SECRET
-    )
+def construct_webhook_event(payload: bytes, signature: str, secret: str) -> dict:
+    """Verify signature with the given secret and return the parsed event.
+
+    Works for both v1 snapshot and v2 thin events — the HMAC signing is
+    identical; only the payload shape differs.
+    """
+    if not secret:
+        raise RuntimeError("Webhook secret is not configured")
+    return stripe.Webhook.construct_event(payload, signature, secret)

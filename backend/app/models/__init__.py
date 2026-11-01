@@ -9,3 +9,4 @@ from app.models.strike import Strike  # noqa: F401
 from app.models.notification import Notification  # noqa: F401
 from app.models.push_token import PushToken  # noqa: F401
 from app.models.processed_event import ProcessedEvent  # noqa: F401
+from app.models.escalation import Escalation  # noqa: F401
