@@ -3,6 +3,7 @@ import json
 
 from app.models.booking import Booking
 from app.models.client import Client
+from app.models.escalation import Escalation
 from app.models.mover import Mover
 from app.models.notification import Notification
 from app.models.service import Service
@@ -13,6 +14,16 @@ def _iso(dt):
     return dt.isoformat() if dt else None
 
 
+def _parse_permissions(raw: str) -> list:
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, list) else []
+    except (ValueError, TypeError):
+        return []
+
+
 def serialize_user(user: User) -> dict:
     """Public shape of a user, matching the Phase 1 contract."""
     return {
@@ -20,6 +31,7 @@ def serialize_user(user: User) -> dict:
         "email": user.email,
         "username": user.username,
         "role": user.role,
+        "permissions": _parse_permissions(user.permissions),
         "phone": user.phone,
         "is_active": user.is_active,
         "strikes": user.strikes,
@@ -114,4 +126,45 @@ def serialize_notification(n: Notification) -> dict:
         "data": data,
         "read": n.is_read,
         "created_at": _iso(n.created_at),
+    }
+
+
+def serialize_manager(user: User) -> dict:
+    """Manager view for the admin panel. Distinct from the self view."""
+    return {
+        "id": user.id,
+        "email": user.email,
+        "username": user.username,
+        "role": user.role,
+        "permissions": _parse_permissions(user.permissions),
+        "phone": user.phone,
+        "is_active": user.is_active,
+        "created_at": _iso(user.created_at),
+        "updated_at": _iso(user.updated_at),
+    }
+
+
+def serialize_escalation(e: Escalation) -> dict:
+    return {
+        "id": e.id,
+        "created_by_id": e.created_by_id,
+        "subject": e.subject,
+        "body": e.body,
+        "related_user_id": e.related_user_id,
+        "related_booking_id": e.related_booking_id,
+        "status": e.status,
+        "resolved_by_id": e.resolved_by_id,
+        "resolved_at": _iso(e.resolved_at),
+        "created_at": _iso(e.created_at),
+    }
+
+def serialize_strike(strike, creator_username=None) -> dict:
+    return {
+        "id": strike.id,
+        "user_id": strike.user_id,
+        "booking_id": strike.booking_id,
+        "reason": strike.reason,
+        "issued_at": _iso(strike.issued_at),
+        "created_by_id": strike.created_by_id,
+        "created_by_username": creator_username,
     }

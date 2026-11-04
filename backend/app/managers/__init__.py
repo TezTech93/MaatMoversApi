@@ -1,6 +1,7 @@
 from app.managers import (  # noqa: F401
     booking_manager,
     client_manager,
+    escalation_manager,
     mover_manager,
     notification_manager,
     payment_manager,

@@ -4,8 +4,16 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
 from app.routers import (
-    about, auth, bookings, clients, movers, notifications,
-    payments, services, users,
+    about,
+    admin,
+    auth,
+    bookings,
+    clients,
+    movers,
+    notifications,
+    payments,
+    services,
+    users,
 )
 
 
@@ -31,6 +39,7 @@ def create_app() -> FastAPI:
     app.include_router(payments.router)
     app.include_router(notifications.router)
     app.include_router(about.router)
+    app.include_router(admin.router)
 
     @app.get("/healthz", tags=["meta"])
     def healthz() -> dict:

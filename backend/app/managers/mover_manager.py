@@ -118,3 +118,44 @@ def find_available(db: Session, *, lat: float, lng: float, radius_miles: int):
             out.append((m, d))
     out.sort(key=lambda x: x[1])
     return out
+
+from sqlalchemy import or_
+
+
+def list_admin(
+    db: Session,
+    *,
+    q: str | None = None,
+    verification_status: str | None = None,
+    include_inactive: bool = False,
+    page: int = 1,
+    page_size: int = 25,
+):
+    """Admin list with search and pagination. Returns (rows, total)."""
+    from app.models.user import User
+
+    base = db.query(Mover).join(User, User.id == Mover.user_id)
+    if not include_inactive:
+        base = base.filter(User.is_active.is_(True))
+    if verification_status:
+        base = base.filter(Mover.verification_status == verification_status)
+    if q:
+        pattern = f"%{q.lower()}%"
+        base = base.filter(
+            or_(
+                User.email.ilike(pattern),
+                User.username.ilike(pattern),
+                Mover.home_address.ilike(pattern),
+            )
+        )
+    total = base.count()
+    offset = (page - 1) * page_size
+    rows = base.order_by(Mover.created_at.desc()).offset(offset).limit(page_size).all()
+    return rows, total
+
+
+def set_verification(db: Session, mover: Mover, status: str) -> Mover:
+    mover.verification_status = status
+    db.commit()
+    db.refresh(mover)
+    return mover

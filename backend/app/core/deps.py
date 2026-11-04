@@ -1,4 +1,6 @@
 """Shared FastAPI dependencies."""
+import json
+
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
@@ -34,21 +36,55 @@ def get_current_user(
 
 
 def require_client(user: User = Depends(get_current_user)) -> User:
-    """Current user must have a client profile."""
     if user.client is None:
         raise HTTPException(status_code=403, detail="Client profile required")
     return user
 
 
 def require_mover(user: User = Depends(get_current_user)) -> User:
-    """Current user must have a mover profile."""
     if user.mover is None:
         raise HTTPException(status_code=403, detail="Mover profile required")
     return user
 
 
 def require_admin(user: User = Depends(get_current_user)) -> User:
-    """Current user must be an admin."""
+    """Supreme admin only. Managers are rejected here."""
     if user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin only")
     return user
+
+
+def _granted_permissions(user: User) -> set:
+    if not user.permissions:
+        return set()
+    try:
+        data = json.loads(user.permissions)
+        return set(data) if isinstance(data, list) else set()
+    except (ValueError, TypeError):
+        return set()
+
+
+def require_permission(*keys: str):
+    """Supreme admins bypass. Managers must hold at least one of `keys`.
+
+    Also accepts the special token 'manager' meaning "any manager,
+    regardless of permissions" — used for endpoints managers should
+    always reach (e.g. raising an escalation).
+    """
+    def checker(user: User = Depends(get_current_user)) -> User:
+        if user.role == "admin":
+            return user
+        if user.role != "manager":
+            raise HTTPException(
+                status_code=403, detail="Admin or manager required"
+            )
+        granted = _granted_permissions(user)
+        if "manager" in keys:
+            return user
+        if not granted.intersection(keys):
+            raise HTTPException(
+                status_code=403,
+                detail=f"Missing permission: {' or '.join(keys)}",
+            )
+        return user
+    return checker

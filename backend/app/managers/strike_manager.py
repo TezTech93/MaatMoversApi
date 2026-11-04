@@ -1,15 +1,4 @@
-"""Strike policy enforcement.
-
-Rules (from the MaatMovers brief):
-- Mover cancels their first-ever accepted booking → immediate block.
-- Mover cancels an accepted booking < 6 hours before scheduled_at → strike.
-- Mover cancels an accepted booking ≥ 6 hours before scheduled_at → no strike.
-- Client cancels an accepted/in_progress booking < 6 hours before scheduled_at → strike.
-- Client cancels ≥ 6 hours out → no strike.
-- Draft or pending cancellations → no strike (no counterparty invested).
-- Admin cancellations → no strike.
-- 3 strikes → block. Strikes are permanent until an admin resets them.
-"""
+"""Strike policy enforcement + admin CRUD."""
 from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
@@ -23,6 +12,10 @@ STRIKE_THRESHOLD = 3
 CANCEL_WINDOW_HOURS = 6
 
 
+# ═══════════════════════════════════════════════════════════
+# Policy (cancellation flow — unchanged)
+# ═══════════════════════════════════════════════════════════
+
 def _hours_until_scheduled(booking: Booking) -> float:
     if not booking.scheduled_at:
         return float("inf")
@@ -33,7 +26,6 @@ def _hours_until_scheduled(booking: Booking) -> float:
 
 
 def _prior_accepts(db: Session, mover_id: int, current_booking_id: int) -> int:
-    """Bookings this mover had been assigned to before this one."""
     return (
         db.query(Booking)
         .filter(
@@ -45,10 +37,6 @@ def _prior_accepts(db: Session, mover_id: int, current_booking_id: int) -> int:
 
 
 def evaluate_cancellation(db: Session, *, booking: Booking, canceller: User) -> dict:
-    """Return a preview of what would happen if `canceller` cancels `booking`.
-
-    Pure read. Never mutates state.
-    """
     hours = _hours_until_scheduled(booking)
     within_window = hours < CANCEL_WINDOW_HOURS
     base = {
@@ -60,45 +48,27 @@ def evaluate_cancellation(db: Session, *, booking: Booking, canceller: User) -> 
         "hours_until_scheduled": round(hours, 2) if hours != float("inf") else None,
     }
 
-    # Draft / pending → no strike. Nothing has happened yet.
     if booking.status in ("draft", "pending"):
         return base
-
-    # Admin → no strike.
     if canceller.role == "admin":
         return base
 
-    # Mover who owns the assignment.
     if canceller.mover is not None and booking.mover_id == canceller.mover.id:
         prior = _prior_accepts(db, canceller.mover.id, booking.id)
         if prior == 0:
-            return {
-                **base,
-                "strike_eligible": True,
-                "would_strike": True,
-                "first_accept_block": True,
-                "would_reach_block": True,
-            }
+            return {**base, "strike_eligible": True, "would_strike": True,
+                    "first_accept_block": True, "would_reach_block": True}
         if within_window:
             new_count = canceller.strikes + 1
-            return {
-                **base,
-                "strike_eligible": True,
-                "would_strike": True,
-                "would_reach_block": new_count >= STRIKE_THRESHOLD,
-            }
+            return {**base, "strike_eligible": True, "would_strike": True,
+                    "would_reach_block": new_count >= STRIKE_THRESHOLD}
         return {**base, "strike_eligible": True}
 
-    # Client who owns the booking.
     if canceller.client is not None and booking.client_id == canceller.client.id:
         if within_window:
             new_count = canceller.strikes + 1
-            return {
-                **base,
-                "strike_eligible": True,
-                "would_strike": True,
-                "would_reach_block": new_count >= STRIKE_THRESHOLD,
-            }
+            return {**base, "strike_eligible": True, "would_strike": True,
+                    "would_reach_block": new_count >= STRIKE_THRESHOLD}
         return {**base, "strike_eligible": True}
 
     return base
@@ -107,10 +77,6 @@ def evaluate_cancellation(db: Session, *, booking: Booking, canceller: User) -> 
 def apply_cancellation_strike(
     db: Session, *, booking: Booking, canceller: User, reason: str
 ) -> dict:
-    """Apply the strike policy. Mutates canceller.strikes / is_blocked and inserts a Strike row.
-
-    Returns: { strike_issued, blocked_now, strike_reason, current_strikes, is_blocked }
-    """
     preview = evaluate_cancellation(db, booking=booking, canceller=canceller)
     strike_issued = False
     blocked_now = False
@@ -121,9 +87,7 @@ def apply_cancellation_strike(
         strike_reason = "Mover cancelled their first accepted assignment"
     elif preview["would_strike"]:
         strike_issued = True
-        strike_reason = (
-            f"Cancelled within {CANCEL_WINDOW_HOURS}h of scheduled time"
-        )
+        strike_reason = f"Cancelled within {CANCEL_WINDOW_HOURS}h of scheduled time"
 
     if strike_issued:
         canceller.strikes = canceller.strikes + 1
@@ -145,3 +109,75 @@ def apply_cancellation_strike(
         "current_strikes": canceller.strikes,
         "is_blocked": canceller.is_blocked,
     }
+
+
+# ═══════════════════════════════════════════════════════════
+# Admin CRUD
+# ═══════════════════════════════════════════════════════════
+
+def list_for_user(db: Session, user_id: int):
+    """Return list of (strike, creator_username_or_None) tuples."""
+    rows = (
+        db.query(Strike, User.username)
+        .outerjoin(User, User.id == Strike.created_by_id)
+        .filter(Strike.user_id == user_id)
+        .order_by(Strike.issued_at.desc())
+        .all()
+    )
+    return rows
+
+
+def get_by_id(db: Session, strike_id: int) -> Strike | None:
+    return db.query(Strike).filter(Strike.id == strike_id).first()
+
+
+def create_manual(
+    db: Session,
+    *,
+    target: User,
+    reason: str,
+    created_by_id: int,
+    booking_id: int | None = None,
+) -> tuple[Strike, bool]:
+    """Create a manual strike. Returns (strike, blocked_now)."""
+    strike = Strike(
+        user_id=target.id,
+        booking_id=booking_id,
+        reason=reason,
+        created_by_id=created_by_id,
+    )
+    db.add(strike)
+    target.strikes = target.strikes + 1
+    blocked_now = False
+    if target.strikes >= STRIKE_THRESHOLD and not target.is_blocked:
+        target.is_blocked = True
+        blocked_now = True
+    db.commit()
+    db.refresh(strike)
+    db.refresh(target)
+    return strike, blocked_now
+
+
+def delete_strike(db: Session, strike: Strike) -> User:
+    """Delete one strike and decrement the user's counter. Does NOT auto-unblock."""
+    target = db.query(User).filter(User.id == strike.user_id).first()
+    if target is not None and target.strikes > 0:
+        target.strikes = target.strikes - 1
+    db.delete(strike)
+    db.commit()
+    if target is not None:
+        db.refresh(target)
+    return target
+
+
+def clear_for_user(db: Session, target: User) -> int:
+    """Delete all strikes for a user and reset counter. Also unblocks.
+
+    Returns the number of strike rows deleted.
+    """
+    count = db.query(Strike).filter(Strike.user_id == target.id).delete()
+    target.strikes = 0
+    target.is_blocked = False
+    db.commit()
+    db.refresh(target)
+    return count
